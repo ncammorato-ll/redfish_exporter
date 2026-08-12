@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"path"
 	"slices"
 	"sort"
 	"strings"
@@ -566,6 +567,219 @@ func TestParseLeakDetector(t *testing.T) {
 		require.Equal(t, float64(1), dto.Gauge.GetValue())
 	}
 }
+
+func TestListChassisFiltersBeforeFetching(t *testing.T) {
+	members := []map[string]string{
+		{"@odata.id": "/redfish/v1/Chassis/Chassis_0"},
+		{"@odata.id": "/redfish/v1/Chassis/HGX_GPU_0"},
+		{"@odata.id": "/redfish/v1/Chassis/HGX_ERoT_BMC_0"},
+	}
+
+	newServer := func(t *testing.T) (*testRedfishServer, *[]string) {
+		t.Helper()
+		server := newTestRedfishServer(t)
+		server.addRoute("/redfish/v1/Chassis", map[string]any{
+			"@odata.id":   "/redfish/v1/Chassis",
+			"@odata.type": "#ChassisCollection.ChassisCollection",
+			"Members":     members,
+		})
+		fetched := &[]string{}
+		for _, member := range members {
+			uri := member["@odata.id"]
+			id := path.Base(uri)
+			server.mux.HandleFunc(uri, func(w http.ResponseWriter, r *http.Request) {
+				*fetched = append(*fetched, id)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"@odata.id":"` + uri + `","@odata.type":"#Chassis.v1_22_0.Chassis","Id":"` + id + `","Status":{"Health":"OK","State":"Enabled"}}`))
+			})
+		}
+		return server, fetched
+	}
+
+	t.Run("an include pattern fetches only matching chassis", func(t *testing.T) {
+		server, fetched := newServer(t)
+		client := connectToTestServer(t, server.Server)
+		t.Cleanup(func() { client.Logout(); server.Close() })
+
+		collector, err := NewChassisCollector(t.Name(), client, NewTestLogger(t, slog.LevelDebug), config.ChassisCollectorConfig{
+			ChassisInclude: "^Chassis_[0-9]+$",
+		})
+		require.NoError(t, err)
+
+		chassises, err := collector.listChassis(context.Background(), NewTestLogger(t, slog.LevelDebug))
+		require.NoError(t, err)
+		require.Len(t, chassises, 1)
+		require.Equal(t, "Chassis_0", chassises[0].ID)
+		require.Equal(t, []string{"Chassis_0"}, *fetched,
+			"the filtered-out chassis bodies must never be requested")
+	})
+
+	t.Run("an exclude pattern skips matching chassis", func(t *testing.T) {
+		server, fetched := newServer(t)
+		client := connectToTestServer(t, server.Server)
+		t.Cleanup(func() { client.Logout(); server.Close() })
+
+		collector, err := NewChassisCollector(t.Name(), client, NewTestLogger(t, slog.LevelDebug), config.ChassisCollectorConfig{
+			ChassisExclude: "^HGX_",
+		})
+		require.NoError(t, err)
+
+		chassises, err := collector.listChassis(context.Background(), NewTestLogger(t, slog.LevelDebug))
+		require.NoError(t, err)
+		require.Len(t, chassises, 1)
+		require.Equal(t, []string{"Chassis_0"}, *fetched)
+	})
+
+	// No filter must keep the historical listing, which costs one request fewer: there is
+	// nothing to decide, so there is no reason to read the service root for the link.
+	t.Run("no filter fetches every chassis", func(t *testing.T) {
+		server, fetched := newServer(t)
+		client := connectToTestServer(t, server.Server)
+		t.Cleanup(func() { client.Logout(); server.Close() })
+
+		collector, err := NewChassisCollector(t.Name(), client, NewTestLogger(t, slog.LevelDebug), config.DefaultChassisCollector)
+		require.NoError(t, err)
+
+		chassises, err := collector.listChassis(context.Background(), NewTestLogger(t, slog.LevelDebug))
+		require.NoError(t, err)
+		require.Len(t, chassises, 3)
+		require.Len(t, *fetched, 3)
+	})
+}
+
+// newSensorChassisServer wires a Sensors-only chassis, which is the shape of an
+// ARS-121GL-NB3 tray shelf: no Thermal, no Power, everything through Sensors.
+func newSensorChassisServer(t *testing.T) *testRedfishServer {
+	t.Helper()
+	server := newTestRedfishServer(t)
+	server.addRouteFromFixture("/redfish/v1/Chassis", "chassis_collection.json")
+	server.addRouteFromFixture("/redfish/v1/Chassis/Chassis_0", "chassis_main.json")
+	server.addRouteFromFixture("/redfish/v1/Chassis/Chassis_0/Sensors", "chassis_sensors_expanded.json")
+	return server
+}
+
+// collectChassis runs a full scrape against server with cfg and returns the drained metrics.
+func collectChassis(t *testing.T, server *testRedfishServer, cfg config.ChassisCollectorConfig) map[string][]collectedMetric {
+	t.Helper()
+	client := connectToTestServer(t, server.Server)
+	t.Cleanup(func() { client.Logout(); server.Close() })
+
+	collector, err := NewChassisCollector(t.Name(), client, NewTestLogger(t, slog.LevelDebug), cfg)
+	require.NoError(t, err)
+
+	ch := make(chan prometheus.Metric, 512)
+	collector.CollectWithContext(context.Background(), ch)
+	return drainMetrics(t, ch)
+}
+
+func TestChassisCollectorSensorExclude(t *testing.T) {
+	t.Run("excluded sensors emit nothing", func(t *testing.T) {
+		metrics := collectChassis(t, newSensorChassisServer(t), config.ChassisCollectorConfig{
+			SensorExclude: ptr("_PWM$"),
+		})
+		require.NotContains(t, metrics, "redfish_chassis_sensor_percent")
+		require.Contains(t, metrics, "redfish_chassis_sensor_watts")
+	})
+
+	// An explicitly empty pattern is how a deployment opts back in to everything,
+	// including the per-core utilisation the shipped default declines.
+	t.Run("an empty pattern excludes nothing", func(t *testing.T) {
+		collector, err := NewChassisCollector(t.Name(), nil, NewTestLogger(t, slog.LevelWarn), config.ChassisCollectorConfig{
+			SensorExclude: ptr(""),
+		})
+		require.NoError(t, err)
+		require.False(t, collector.skipSensor("ProcessorModule_0_CPU_0_CoreUtil_0"))
+	})
+
+	// The default declines per-core CPU utilisation, which a GB300 tray publishes 144 of.
+	// The telemetry collector declines the identical sensors; the two collectors must not
+	// disagree about the same hardware.
+	//
+	// Every construction path must agree on that, or a hand-written chassis_collector
+	// block would quietly collect more than the module shipped beside it. The zero value
+	// is the case that matters: it is what `chassis_collector: {}` unmarshals to.
+	t.Run("every unconfigured path declines per-core utilisation", func(t *testing.T) {
+		for tName, cfg := range map[string]config.ChassisCollectorConfig{
+			"shipped default":        config.DefaultChassisCollector,
+			"zero value":             {},
+			"configured but not set": {DisableNetworkAdapters: true},
+			"built-in module":        config.DefaultModuleConfig["chassis_collector"].ChassisCollector,
+		} {
+			t.Run(tName, func(t *testing.T) {
+				collector, err := NewChassisCollector(t.Name(), nil, NewTestLogger(t, slog.LevelWarn), cfg)
+				require.NoError(t, err)
+
+				require.True(t, collector.skipSensor("ProcessorModule_0_CPU_0_CoreUtil_0"))
+				require.True(t, collector.skipSensor("ProcessorModule_1_CPU_0_CoreUtil_71"))
+				require.False(t, collector.skipSensor("ProcessorModule_0_CPU_0_CpuFreq_0"))
+				require.False(t, collector.skipSensor("Chassis_0_FAN_1_PWM"))
+			})
+		}
+	})
+}
+
+func TestChassisCollectorFiltering(t *testing.T) {
+	t.Run("include and exclude patterns", func(t *testing.T) {
+		tT := map[string]struct {
+			include, exclude string
+			chassisID        string
+			wantSkip         bool
+		}{
+			"no filters collects everything":   {chassisID: "HGX_GPU_0", wantSkip: false},
+			"include matches":                  {include: "^Chassis_[0-9]+$", chassisID: "Chassis_0", wantSkip: false},
+			"include does not match":           {include: "^Chassis_[0-9]+$", chassisID: "HGX_GPU_0", wantSkip: true},
+			"exclude matches":                  {exclude: "^HGX_", chassisID: "HGX_GPU_0", wantSkip: true},
+			"exclude does not match":           {exclude: "^HGX_", chassisID: "Chassis_0", wantSkip: false},
+			"exclude takes effect via include": {include: "^Chassis_", exclude: "_1$", chassisID: "Chassis_1", wantSkip: true},
+		}
+		for tName, test := range tT {
+			t.Run(tName, func(t *testing.T) {
+				collector, err := NewChassisCollector(t.Name(), nil, NewTestLogger(t, slog.LevelWarn), config.ChassisCollectorConfig{
+					ChassisInclude: test.include,
+					ChassisExclude: test.exclude,
+				})
+				require.NoError(t, err)
+				require.Equal(t, test.wantSkip, collector.skipChassis(test.chassisID))
+			})
+		}
+	})
+
+	t.Run("an invalid pattern is reported at construction", func(t *testing.T) {
+		_, err := NewChassisCollector(t.Name(), nil, NewTestLogger(t, slog.LevelWarn), config.ChassisCollectorConfig{
+			ChassisInclude: "([unclosed",
+		})
+		require.ErrorContains(t, err, "invalid chassis_include pattern")
+
+		_, err = NewChassisCollector(t.Name(), nil, NewTestLogger(t, slog.LevelWarn), config.ChassisCollectorConfig{
+			ChassisExclude: "([unclosed",
+		})
+		require.ErrorContains(t, err, "invalid chassis_exclude pattern")
+
+		_, err = NewChassisCollector(t.Name(), nil, NewTestLogger(t, slog.LevelWarn), config.ChassisCollectorConfig{
+			SensorExclude: ptr("([unclosed"),
+		})
+		require.ErrorContains(t, err, "invalid sensor_exclude pattern")
+	})
+
+	// The zero-value config must skip no chassis and no subsystem, so that existing
+	// deployments passing chassis_collector: {} keep collecting what they always have.
+	t.Run("zero value config disables nothing", func(t *testing.T) {
+		var cfg config.ChassisCollectorConfig
+		require.False(t, cfg.DisableThermal)
+		require.False(t, cfg.DisableThermalSubsystem)
+		require.False(t, cfg.DisablePower)
+		require.False(t, cfg.DisableNetworkAdapters)
+		require.False(t, cfg.DisableSensors)
+		require.Empty(t, cfg.ChassisInclude)
+		require.Empty(t, cfg.ChassisExclude)
+		require.Equal(t, config.DefaultChassisCollector, cfg,
+			"the shipped default must be the zero value, so no construction path is special")
+	})
+}
+
+// ptr returns a pointer to v, for the config fields where an absent key and an empty value
+// mean different things.
+func ptr[T any](v T) *T { return &v }
 
 // TestCollectTotalGPUPower tests the collection of total GPU power metric
 // Note: This metric is now collected via TelemetryService (HGX_PlatformEnvironmentMetrics_0)
