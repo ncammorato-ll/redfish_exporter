@@ -61,6 +61,27 @@ var (
 			Prober:             "telemetry_collector",
 			TelemetryCollector: DefaultTelemetryCollector,
 		},
+		// leak_detection is a chassis_collector narrowed to coolant leak monitoring, so
+		// that leak state can be scraped on a much shorter interval than a full chassis
+		// scrape allows. See docs/CONFIGURATION.md.
+		//
+		// Disabling Thermal and Power together is load-bearing rather than incidental:
+		// on the liquid-cooled platforms this targets no chassis implements either, so
+		// the Sensors pass would otherwise stand in for what was just disabled. Setting
+		// both narrows that pass to the leak detectors.
+		//
+		// Deliberately not in the rf_exporter_default bundle, and deliberately unfiltered
+		// — chassis naming is vendor specific. Set chassis_include to match only the
+		// chassis carrying detectors ("^Chassis_[0-9]+$" on a Supermicro NVL72 tray,
+		// "^MGX_BMC_[0-9]+$" on an MGX NVSwitch tray) for a large further saving.
+		"leak_detection": {
+			Prober: "chassis_collector",
+			ChassisCollector: ChassisCollectorConfig{
+				DisableThermal:         true,
+				DisablePower:           true,
+				DisableNetworkAdapters: true,
+			},
+		},
 	}
 	DefaultRedfishConfig = RedfishClientConfig{
 		MaxConcurrentRequests: 1,
@@ -126,22 +147,31 @@ type ChassisCollectorConfig struct {
 	// It is a pointer because an absent key and an empty pattern have to mean different
 	// things: absent is "whatever ships by default", empty is "exclude nothing". Read it
 	// through SensorExcludePattern rather than directly.
+	//
+	// Leak detector sensors are never excluded by it. Silently dropping a safety signal
+	// through a broad pattern is not a tradeoff worth offering.
 	SensorExclude *string `mapstructure:"sensor_exclude"`
 
 	// DisableThermal skips the legacy Thermal schema (temperatures and fans).
 	DisableThermal bool `mapstructure:"disable_thermal"`
 	// DisableThermalSubsystem skips ThermalSubsystem, and with it leak detection.
+	//
+	// Detector voltages are correlated by Id against the LeakDetector resources
+	// enumerated there, so this also stops those sensors being recognised: they fold
+	// into the generic chassis voltage family instead. Nothing in a Sensor payload
+	// identifies one, so there is no fallback. See docs/CONFIGURATION.md.
 	DisableThermalSubsystem bool `mapstructure:"disable_thermal_subsystem"`
 	// DisablePower skips the legacy Power schema (voltages and power supplies).
 	DisablePower bool `mapstructure:"disable_power"`
 	// DisableNetworkAdapters skips NetworkAdapters and their NetworkPorts. This is
 	// often the most expensive subsystem, at one request per adapter plus one per port.
 	DisableNetworkAdapters bool `mapstructure:"disable_network_adapters"`
-	// DisableSensors skips the Sensors collection entirely.
+	// DisableSensors skips the Sensors collection entirely, including the leak detector
+	// voltages.
 	//
-	// Setting DisableThermal and DisablePower together also skips it: an operator who has
-	// opted out of bulk thermal and power data has not asked for it back under a
-	// different schema.
+	// Setting DisableThermal and DisablePower together instead narrows the Sensors pass
+	// to the leak detectors: an operator who has opted out of bulk thermal and power data
+	// has not asked for it back under a different schema.
 	DisableSensors bool `mapstructure:"disable_sensors"`
 }
 

@@ -70,8 +70,32 @@ The Chassis Collector primarily exposes health data from the Chassis API. Agains
 # HELP redfish_chassis_health_rollup health rollup of chassis,1(OK),2(Warning),3(Critical)
 # TYPE redfish_chassis_health_rollup gauge
 
+# HELP redfish_chassis_leak_detection_health health of the chassis leak detection subsystem as a whole,1(OK),2(Warning),3(Critical)
+# TYPE redfish_chassis_leak_detection_health gauge
+
+# HELP redfish_chassis_leak_detection_state state of the chassis leak detection subsystem as a whole,1(Enabled),2(Disabled),...
+# TYPE redfish_chassis_leak_detection_state gauge
+
+# HELP redfish_chassis_leak_detector_enabled whether this chassis leak detector is enabled, 1(enabled),0(disabled); a disabled detector does not trigger events
+# TYPE redfish_chassis_leak_detector_enabled gauge
+
 # HELP redfish_chassis_leak_detector_health chassis leak detector health state,1(OK),2(Warning),3(Critical)
 # TYPE redfish_chassis_leak_detector_health gauge
+
+# HELP redfish_chassis_leak_detector_info chassis leak detector type and physical location, always 1
+# TYPE redfish_chassis_leak_detector_info gauge
+
+# HELP redfish_chassis_leak_detector_state chassis leak detector state; this is the signal to alert on, and a Critical state is a detector trip that the companion voltage classifies as wet or as contamination,1(OK),2(Warning),3(Critical),4(Unavailable),5(Absent)
+# TYPE redfish_chassis_leak_detector_state gauge
+
+# HELP redfish_chassis_leak_detector_volts chassis leak detector reading in volts; falls toward the lower critical threshold as moisture is detected
+# TYPE redfish_chassis_leak_detector_volts gauge
+
+# HELP redfish_chassis_leak_detector_volts_lower_threshold_critical voltage at or below which this chassis leak detector reports a critical leak
+# TYPE redfish_chassis_leak_detector_volts_lower_threshold_critical gauge
+
+# HELP redfish_chassis_leak_detector_volts_upper_threshold_critical voltage at or above which this chassis leak detector is considered faulty, typically an open or shorted sense line rather than a leak
+# TYPE redfish_chassis_leak_detector_volts_upper_threshold_critical gauge
 
 # HELP redfish_chassis_model_info organization responsible for producing the chassis, the name by which the manufacturer generally refers to the chassis, and a part number and sku assigned by the organization that is responsible for producing or manufacturing the chassis
 # TYPE redfish_chassis_model_info gauge
@@ -97,9 +121,14 @@ implements `Thermal`/`Power`:
 | `Voltage` | `redfish_chassis_power_voltage_volts` (+ `_state`) |
 | anything else | `redfish_chassis_sensor_{watts,amperes,joules,hertz,percent,reading}` |
 
-The collection is consulted only on a chassis that advertises neither `Thermal` nor `Power`.
-Collecting it alongside them would publish that chassis's temperatures twice under the same
-series name, which fails the whole scrape at registration rather than merely thinning it.
+`Sensors` is consulted for two distinct reasons, and the reason decides what is emitted:
+
+- **Standing in for the legacy schemas**, on a chassis advertising neither `Thermal` nor
+  `Power`. The whole collection is emitted.
+- **For the leak detectors alone**, on a chassis that carries them, since their voltages
+  live nowhere else. Only those sensors are emitted — otherwise a chassis implementing
+  `Thermal` *and* leak detection would publish its temperatures twice under the same series
+  name, which fails the whole scrape at registration.
 
 A chassis advertising no `Sensors` collection is never asked for one. This matters more
 than it sounds: the `ERoT`/`IRoT` roots are roughly a third of the chassis on an NVL72 tray
@@ -108,12 +137,133 @@ on every scrape.
 
 Readings are not inferred from sensor naming: fan PWM duty cycle and CPU core utilisation
 are both `ReadingType: Percent` and neither carries a distinguishing `PhysicalContext`, so
-`Percent` reaches the catch-all rather than being assumed to be a fan speed.
+`Percent` reaches the catch-all rather than being assumed to be a fan speed. Sensors that
+are simply not wanted are dropped by `sensor_exclude` (below) rather than by a rule in the
+collector.
 
 The collection is fetched with `$expand` so the BMC inlines every member body, costing one
-request per chassis rather than one per sensor. A BMC that does not honour `$expand` is
-**not** fanned out to one request per sensor — that would multiply load against the BMCs
-least able to absorb it — so the bulk sensor telemetry is skipped with a warning instead.
+request per chassis rather than one per sensor. Measured against captured BMC dumps, the net
+change in requests per scrape is **−2 to +2** — the new `Sensors` requests are paid for by a
+duplicate `LeakDetection` request this release also removes:
+
+| Platform | before | after |
+| --- | --- | --- |
+| SYS-A21GE-NBRT (B200, 39 chassis) | 116 | 115 |
+| SYS-821GE-TNHR (H100/H200, 43) | 118–119 | 117–118 |
+| ARS-121GL-NB3 (GB300 tray, 42) | 124 | 124 |
+| N5500_LD (MGX NVSwitch tray, 12) | 48 | 48 |
+| GH200 (4) | 20 | 22 |
+
+A BMC that does not honour `$expand` is **not** fanned out to one request per sensor — that
+would multiply load against the BMCs least able to absorb it. Only the leak detector sensors
+are then fetched individually and the bulk sensor telemetry is skipped with a warning, so
+request count stays flat and the safety-relevant readings still arrive.
+
+#### Leak detection
+
+`redfish_chassis_leak_detector_state` is the signal to alert on. A `Critical` state is a
+detector *trip* rather than a confirmed leak — see the classification below — but every trip
+warrants a response.
+
+`..._health` carries the same value today, and that is not a coincidence. Every detector on
+every platform we have captured is `LeakDetector.v1_1_0`, where `DetectorState` is a `$ref`
+to `Resource.Health`, so the two share a single `OK`/`Warning`/`Critical` enum. Either metric
+detects a trip, and both did on the three GB300 trays we captured with a tripped detector.
+
+Both are emitted because the schema separates them later. From `v1_3_0` `DetectorState` only
+*should* equate to `Health`; `v1_6_0` narrows that to "when the detector is enabled and
+functional" and adds that a detector fault — a short, a disconnected cable — is reported
+through `Status.Conditions`. So `Health` is the rollup that goes non-OK for a leak *or* a
+fault, while `DetectorState` is the leak-specific reading. Prefer `..._state` for leak
+alerting so the distinction lands correctly on firmware that implements it.
+
+**Alert on `== 3`, never `>= 2`.** Unlike the health encoding, values above 3 do not mean
+"worse than critical": 4 (`Unavailable`) and 5 (`Absent`) mean the detector is not reporting,
+so a `> 2` expression would fire a critical leak for an absent detector. Use `== 2` for a
+warning-level trip and `== 3` for a critical one.
+
+Note that 4 and 5 only exist from `LeakDetector.v1_6_0`, so on current firmware they are
+unreachable and a `>= 4` blind-spot alert cannot fire. The mapping is there so that firmware
+gaining those values later is handled correctly rather than silently misread. The same
+applies to `redfish_chassis_leak_detector_enabled`: `Enabled` arrives in `v1_3_0` and is
+absent everywhere today, so the series is not emitted at all rather than defaulting to 0.
+
+**A faulted detector is currently invisible on the switch trays.** `Status.Conditions` needs
+Resource `v1_11_0` and appears in no captured payload, so a trip and a broken detector cannot
+be told apart from the state and health metrics alone. On a compute tray the companion
+voltage covers this: a disconnected or shorted rope reads *high*, crossing
+`..._volts_upper_threshold_critical`. The MGX switch tray's detectors have no companion
+sensors, so that check has nothing to read and a dead detector looks like a healthy one.
+
+**Alert on `..._state`; classify with `..._volts`.** Across five captured GB300 trays,
+three show a detector reporting `DetectorState: Critical` while its companion voltage sits
+at a nominal ~1.72 V, well clear of the lower critical threshold. All three were real
+detector trips and none was a coolant leak: the cause was dust bridging the sense contacts.
+The detector measures resistance across those contacts, so anything conductive enough to
+bridge them trips it, and a dust bridge trips the discrete state without pulling the divider
+voltage far enough to cross its own threshold.
+
+That disagreement is the diagnosis, available at alert time rather than after someone opens
+the tray. Page on the state, and let the voltage decide which runbook fires:
+
+```promql
+# 1. Confirmed wet-out: the trip is corroborated by the analog reading. Coolant leak.
+redfish_chassis_leak_detector_state == 3
+  and on (instance, chassis_id, leak_detection_id, leak_detector_id)
+    redfish_chassis_leak_detector_volts <= redfish_chassis_leak_detector_volts_lower_threshold_critical
+
+# 2. Trip with the voltage present and nominal: contamination across the sense contacts is
+#    the likeliest cause. Real, and worth a physical inspection, but not a leak response.
+(redfish_chassis_leak_detector_state == 3
+  and on (instance, chassis_id, leak_detection_id, leak_detector_id)
+    redfish_chassis_leak_detector_volts)
+  unless on (instance, chassis_id, leak_detection_id, leak_detector_id)
+    redfish_chassis_leak_detector_volts <= redfish_chassis_leak_detector_volts_lower_threshold_critical
+
+# 3. Trip on a detector that publishes no voltage at all (the MGX NVSwitch tray). Not
+#    classifiable without opening the tray, so treat it at leak severity.
+redfish_chassis_leak_detector_state == 3
+  unless on (instance, chassis_id, leak_detection_id, leak_detector_id)
+    redfish_chassis_leak_detector_volts
+```
+
+**The arms must cover the whole of `..._state == 3` between them**, which is why the third
+exists: without it, rule 2 also matches every detector that publishes no voltage, and a real
+leak on the NVSwitch tray would route to the contamination runbook. Shipping only rule 1
+would suppress all three captured events outright. If you take one rule rather than three,
+take the bare `..._state == 3` — the classification refines the alert, it never filters it.
+
+Coverage varies by platform, so `..._state` is the only signal available everywhere:
+
+- **GB300 compute tray (ARS-121GL-NB3):** 4 detectors on the tray shelf chassis, each with
+  a companion `Sensor` giving `..._volts` and its thresholds. These are resistive moisture
+  ropes on a voltage divider — dry reads high (~1.72 V) and water pulls the voltage *down*
+  toward the lower critical threshold, so the leak alarm is a **lower** critical crossing.
+  The threshold value is firmware-dependent (1.3 V and 1.65 V both appear across captured
+  trays), which is why it is exported as a metric rather than written into an alert. It is
+  only exposed on the `Sensor` resource, never in the telemetry metric report.
+  `..._volts_upper_threshold_critical` (2.0 V where reported) is *not* a wetter-still
+  reading: an open or shorted sense line reads high, so crossing it means the detector has
+  stopped being able to see a leak.
+- **MGX NVSwitch tray (P3809):** 7 detectors (including an aggregate, `leakage_aggr`) on one
+  chassis, with six further chassis exposing an empty detector collection. Discrete only —
+  no companion voltage sensors. Note the aggregate is structurally indistinguishable from
+  the individual detectors, so an unqualified alert will fire twice for one physical leak.
+- Some BMCs advertise a `LeakDetection` link that then returns 404; this is logged at debug
+  level and emits nothing.
+
+The companion voltages are correlated by Id against the `LeakDetector` resources enumerated
+from `ThermalSubsystem`, and nothing in a `Sensor` payload identifies one on its own — no
+`PhysicalContext`, no marker, and `RelatedItem` points only at the system. So whenever that
+enumeration does not happen, those sensors are not recognised and fold into the generic
+voltage family: `redfish_chassis_leak_detector_volts` disappears and the same reading
+reappears as `redfish_chassis_power_voltage_volts{power_voltage_id="..._LeakDetector_..."}`.
+That happens when `disable_thermal_subsystem` is set, and transiently whenever the
+`ThermalSubsystem` request fails. There is no fallback available.
+
+This is the reason to **alert on the absence of `redfish_chassis_leak_detector_state`**, not
+only on its value. A tray whose detectors have stopped being reported looks exactly like a dry
+tray to any alert written on the value alone.
 
 #### Configuration
 
@@ -125,7 +275,7 @@ chassis_collector:
 
   # Regular expression matched against each Sensor Id. Matching sensors emit no metrics.
   # Trims series count, not request count: the collection arrives in one request either
-  # way.
+  # way. Leak detector sensors are never excluded by this pattern.
   #
   # Omitting the key and setting it to "" are different: omitted means the default below,
   # empty means exclude nothing.
@@ -136,19 +286,8 @@ chassis_collector:
   [ disable_thermal_subsystem: <bool> ]   # also disables leak detection
   [ disable_power: <bool> ]
   [ disable_network_adapters: <bool> ]
-  [ disable_sensors: <bool> ]
+  [ disable_sensors: <bool> ]             # also drops the leak detector voltages
 ```
-
-`chassis_include` and `chassis_exclude` filter *before* each chassis body is fetched, by
-matching the trailing segment of the member link. Filtering after the fetch would pay the
-entire per-scrape cost anyway — forty-two chassis fetched to look at one — so a narrowly
-scoped module is the case this exists for. The trailing segment is a convention rather than
-a guarantee, so the fetched `Id` is still checked authoritatively afterwards.
-
-Setting `disable_thermal` and `disable_power` together also suppresses the `Sensors` pass:
-an operator who has opted out of bulk thermal and power data has not asked for it back under
-a different schema. On the platforms that implement neither legacy schema, `Sensors` would
-otherwise stand in for exactly what was just disabled.
 
 `sensor_exclude` defaults to `"_CoreUtil_[0-9]+$"`. A GB300 tray publishes 144 per-core CPU
 utilisation sensors, which is more series than the rest of the chassis collector produces
@@ -166,6 +305,54 @@ sensors, set the pattern to the empty string:
 chassis_collector:
   sensor_exclude: ""
 ```
+
+##### Scraping leak detection on a short interval
+
+A full chassis scrape walks every chassis and can issue over a hundred requests on a tray
+with many chassis, which at the default `max_concurrent_requests: 1` serialises. The
+built-in `leak_detection` module trims that to what a leak alert needs:
+
+```yaml
+modules:
+  leak_detection:
+    prober: chassis_collector
+    chassis_collector:
+      disable_thermal: true
+      disable_power: true
+      disable_network_adapters: true
+      # Optional, and vendor specific. Worth setting: it is the difference between
+      # walking every chassis and walking only the one that carries detectors.
+      # Supermicro NVL72 compute tray:
+      # chassis_include: "^Chassis_[0-9]+$"
+      # MGX NVSwitch tray:
+      # chassis_include: "^MGX_BMC_[0-9]+$"
+```
+
+Setting `disable_thermal` and `disable_power` together does more than skip those two
+fetches: it also narrows the `Sensors` pass to the leak detectors. Without that, on exactly
+the liquid-cooled platforms this module targets — where no chassis implements either legacy
+schema — `Sensors` would stand in for what was just disabled and the module would cost
+almost as much as a full scrape.
+
+Measured requests per scrape, against captured dumps:
+
+| | full chassis scrape | `leak_detection` | + `chassis_include` |
+| --- | --- | --- | --- |
+| ARS-121GL-NB3 (GB300 tray) | 124 | 78 | 11 |
+| N5500_LD (MGX NVSwitch tray) | 48 | 42 | 14 |
+| SYS-A21GE-NBRT (B200) | 115 | 64 | — |
+
+`chassis_include` and `chassis_exclude` are applied to the collection's member links before
+any chassis body is fetched, so a filtered scrape costs one request per *matching* chassis
+rather than one per chassis. That is what makes the module cheap enough to poll on a short
+interval: an unfiltered `leak_detection` scrape of a GB300 tray spends 43 of its 78 requests
+just enumerating the forty-two chassis it is about to discard.
+
+Filtering costs one extra request per scrape — the service root, read to find the
+`ChassisCollection` link rather than assuming it — and matches on the trailing segment of
+each member URI, which by Redfish convention is the chassis `Id`. The pattern is applied
+again to the fetched `Id`, so a BMC that breaks that convention filters correctly, just
+without the saving.
 
 ### `<gpu_collector>`
 [source](../collector/gpu_collector.go)

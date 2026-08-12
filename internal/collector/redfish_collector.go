@@ -261,6 +261,33 @@ func parseCommonStatusHealth(status schemas.Health) (float64, bool) {
 	return float64(0), false
 }
 
+// parseDetectorState maps a Redfish LeakDetector DetectorState to a numeric gauge value.
+//
+// OK/Warning/Critical intentionally share the encoding used by parseCommonStatusHealth,
+// which is more than a convention: through LeakDetector v1_5_0, DetectorState is a $ref to
+// Resource.Health and those three are the only values it can take.
+//
+// Unavailable and Absent arrive with v1_6_0's own enum and extend past Critical, so they
+// cannot be reached on any hardware we have captured. They are mapped anyway, and alert
+// expressions MUST use explicit equality (== 3) rather than the ">= 2"/"> 2" idiom used for
+// health metrics elsewhere, so that firmware gaining those values later does not silently
+// start reporting an absent detector as a critical leak.
+func parseDetectorState(state schemas.DetectorState) (float64, bool) {
+	switch state {
+	case schemas.OKDetectorState:
+		return float64(1), true
+	case schemas.WarningDetectorState:
+		return float64(2), true
+	case schemas.CriticalDetectorState:
+		return float64(3), true
+	case schemas.UnavailableDetectorState:
+		return float64(4), true
+	case schemas.AbsentDetectorState:
+		return float64(5), true
+	}
+	return float64(0), false
+}
+
 func parseCommonStatusState(status schemas.State) (float64, bool) {
 
 	if bytes.Equal([]byte(status), []byte("")) {
