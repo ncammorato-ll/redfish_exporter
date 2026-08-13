@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"regexp"
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -40,9 +41,30 @@ var (
 type ChassisCollector struct {
 	redfishClient         *gofish.APIClient
 	config                config.ChassisCollectorConfig
+	chassisInclude        *regexp.Regexp
+	chassisExclude        *regexp.Regexp
+	sensorExclude         *regexp.Regexp
 	metrics               map[string]Metric
 	logger                *slog.Logger
 	collectorScrapeStatus *prometheus.GaugeVec
+}
+
+// skipChassis reports whether a chassis Id is filtered out by the configured
+// include/exclude patterns. An unset pattern never filters.
+func (c *ChassisCollector) skipChassis(chassisID string) bool {
+	if c.chassisInclude != nil && !c.chassisInclude.MatchString(chassisID) {
+		return true
+	}
+	if c.chassisExclude != nil && c.chassisExclude.MatchString(chassisID) {
+		return true
+	}
+	return false
+}
+
+// skipSensor reports whether a Sensor Id is filtered out by the configured pattern. An
+// unset pattern never filters. See config.ChassisCollectorConfig.SensorExclude.
+func (c *ChassisCollector) skipSensor(sensorID string) bool {
+	return c.sensorExclude != nil && c.sensorExclude.MatchString(sensorID)
 }
 
 func createChassisMetricMap() map[string]Metric {
@@ -111,15 +133,47 @@ func createChassisMetricMap() map[string]Metric {
 	return chassisMetrics
 }
 
+// compileFilter compiles an optional filter pattern, naming it in any error so a bad
+// pattern points at the configuration key that carries it. An empty pattern yields nil,
+// which never filters.
+func compileFilter(name, pattern string) (*regexp.Regexp, error) {
+	if pattern == "" {
+		return nil, nil
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("invalid %s pattern %q: %w", name, pattern, err)
+	}
+	return re, nil
+}
+
 // NewChassisCollector returns a collector that collecting chassis statistics
 func NewChassisCollector(collectorName string, redfishClient *gofish.APIClient, logger *slog.Logger, config config.ChassisCollectorConfig) (*ChassisCollector, error) {
 	// get service from redfish client
 
+	// Compile the filters up front so a bad pattern is reported at collector construction
+	// rather than silently filtering nothing on every scrape.
+	chassisInclude, err := compileFilter("chassis_include", config.ChassisInclude)
+	if err != nil {
+		return nil, err
+	}
+	chassisExclude, err := compileFilter("chassis_exclude", config.ChassisExclude)
+	if err != nil {
+		return nil, err
+	}
+	sensorExclude, err := compileFilter("sensor_exclude", config.SensorExcludePattern())
+	if err != nil {
+		return nil, err
+	}
+
 	return &ChassisCollector{
-		redfishClient: redfishClient,
-		metrics:       chassisMetrics,
-		config:        config,
-		logger:        logger,
+		redfishClient:  redfishClient,
+		metrics:        chassisMetrics,
+		config:         config,
+		chassisInclude: chassisInclude,
+		chassisExclude: chassisExclude,
+		sensorExclude:  sensorExclude,
+		logger:         logger,
 		collectorScrapeStatus: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Namespace: namespace,
@@ -146,14 +200,13 @@ func (c *ChassisCollector) collect(ctx context.Context, ch chan<- prometheus.Met
 		return
 	}
 	logger := c.logger.With(slog.String("collector", "ChassisCollector"))
-	service := c.redfishClient.Service
 
 	if ctx.Err() != nil {
 		c.logger.With("error", ctx.Err(), "collector", "chassis").Debug("skipping collection")
 		return
 	}
 	// get a list of chassis from service
-	chassises, err := service.Chassis()
+	chassises, err := c.listChassis(ctx, logger)
 	if err != nil {
 		// A collection error means some member failed, not that none of them arrived:
 		// gofish still returns the chassis it did fetch. Discarding those made one flaky
@@ -166,6 +219,10 @@ func (c *ChassisCollector) collect(ctx context.Context, ch chan<- prometheus.Met
 	for _, chassis := range chassises {
 		if ctx.Err() != nil {
 			c.logger.With("error", ctx.Err()).Warn("skipping further collection")
+			continue
+		}
+		if c.skipChassis(chassis.ID) {
+			logger.Debug("chassis filtered out by configuration", slog.String("Chassis", chassis.ID))
 			continue
 		}
 		chassisLogger := logger.With(slog.String("Chassis", chassis.ID))
@@ -200,11 +257,11 @@ func (c *ChassisCollector) collect(ctx context.Context, ch chan<- prometheus.Met
 		// series.
 		links := chassisAdvertisedLinks(chassis)
 
-		chassisThermal, err := chassis.Thermal()
+		chassisThermal, err := c.chassisThermal(chassis)
 		if err != nil {
 			chassisLogger.Error("error getting thermal data from chassis", slog.String("operation", "chassis.Thermal()"), slog.Any("error", err))
 		} else if chassisThermal == nil {
-			chassisLogger.Info("no thermal data found", slog.String("operation", "chassis.Thermal()"))
+			chassisLogger.Debug("no thermal data found", slog.String("operation", "chassis.Thermal()"))
 		} else {
 			// process temperature and fans
 			chassisTemperatures := chassisThermal.Temperatures
@@ -233,11 +290,11 @@ func (c *ChassisCollector) collect(ctx context.Context, ch chan<- prometheus.Met
 		// voltages, which is what they would otherwise be mistaken for.
 		leakDetectorIDs := map[string]struct{}{}
 
-		chassisThermalSubsystem, err := chassis.ThermalSubsystem()
+		chassisThermalSubsystem, err := c.chassisThermalSubsystem(chassis)
 		if err != nil {
 			chassisLogger.Error("error getting thermal subsystem from chassis", slog.String("operation", "chassis.ThermalSubsystem()"), slog.Any("error", err))
 		} else if chassisThermalSubsystem == nil {
-			chassisLogger.Info("no thermal subsystem found", slog.String("operation", "chassis.ThermalSubsystem()"))
+			chassisLogger.Debug("no thermal subsystem found", slog.String("operation", "chassis.ThermalSubsystem()"))
 		} else {
 			// NOTE: Handles some odd (maybe even buggy) OEM implementations of LeakDeteactor
 			leakDetectors := c.getLeakDetectors(chassisThermalSubsystem, chassisLogger)
@@ -262,11 +319,11 @@ func (c *ChassisCollector) collect(ctx context.Context, ch chan<- prometheus.Met
 			}
 		}
 
-		chassisPowerInfo, err := chassis.Power()
+		chassisPowerInfo, err := c.chassisPower(chassis)
 		if err != nil {
 			chassisLogger.Error("error getting power data from chassis", slog.String("operation", "chassis.Power()"), slog.Any("error", err))
 		} else if chassisPowerInfo == nil {
-			chassisLogger.Info("no power data found", slog.String("operation", "chassis.Power()"))
+			chassisLogger.Debug("no power data found", slog.String("operation", "chassis.Power()"))
 		} else {
 			egPower := newRecoverGroup(ctx)
 
@@ -302,7 +359,13 @@ func (c *ChassisCollector) collect(ctx context.Context, ch chan<- prometheus.Met
 		// implement neither, so it is consulted only when both are absent. Collecting it
 		// alongside them would publish a chassis's temperatures twice under one series
 		// name, failing the scrape at registration.
-		if !links.legacyThermalOrPower() {
+		//
+		// Disabling both legacy schemas suppresses it too: an operator who has opted out
+		// of bulk thermal and power data has not asked for it back under a different
+		// schema. On the liquid-cooled platforms that implement neither, the Sensors pass
+		// would otherwise stand in for exactly what was just disabled.
+		optedOutOfBulk := c.config.DisableThermal && c.config.DisablePower
+		if !c.config.DisableSensors && !optedOutOfBulk && !links.legacyThermalOrPower() {
 			sensorsPath := links.sensorsPath(chassis)
 			sensors, err := c.getChassisSensors(ctx, sensorsPath, chassisLogger)
 			if err != nil {
@@ -324,13 +387,16 @@ func (c *ChassisCollector) collect(ctx context.Context, ch chan<- prometheus.Met
 					if _, isLeakDetector := leakDetectorIDs[sensor.ID]; isLeakDetector {
 						continue
 					}
+					if c.skipSensor(sensor.ID) {
+						continue
+					}
 					parseChassisSensor(ch, chassisID, sensor)
 				}
 			}
 		}
 
 		// process NetworkAdapter
-		networkAdapters, err := chassis.NetworkAdapters()
+		networkAdapters, err := c.chassisNetworkAdapters(chassis)
 		if err != nil {
 			chassisLogger.Error("error getting network adapters data from chassis", slog.String("operation", "chassis.NetworkAdapters()"), slog.Any("error", err))
 		} else if networkAdapters == nil {
@@ -372,6 +438,112 @@ func (c *ChassisCollector) Describe(ch chan<- *prometheus.Desc) {
 	}
 	c.collectorScrapeStatus.Describe(ch)
 
+}
+
+// listChassis returns the chassis this collector should walk.
+//
+// With no include/exclude pattern this is gofish's own listing, unchanged and one request
+// cheaper than the filtered path.
+//
+// With a pattern, the member links are read first and only matching members are fetched.
+// skipChassis alone filters after every body has been paid for, which on a narrowly scoped
+// module is the entire per-scrape cost: forty-two chassis fetched to look at one.
+//
+// Members are matched on the trailing URI segment, a convention rather than a guarantee, so
+// callers still apply skipChassis to the fetched Id.
+func (c *ChassisCollector) listChassis(ctx context.Context, logger *slog.Logger) ([]*schemas.Chassis, error) {
+	service := c.redfishClient.Service
+	if c.chassisInclude == nil && c.chassisExclude == nil {
+		return service.Chassis()
+	}
+
+	client := c.redfishClient.WithContext(ctx)
+	collectionURI, err := c.chassisCollectionURI(client)
+	if err != nil {
+		logger.Debug("could not read the chassis collection link, falling back to the full listing", slog.Any("error", err))
+		return service.Chassis()
+	}
+
+	memberURIs, err := collectionMemberURIs(client, collectionURI)
+	if err != nil {
+		logger.Debug("could not read chassis collection members, falling back to the full listing", slog.Any("error", err))
+		return service.Chassis()
+	}
+
+	chassises := make([]*schemas.Chassis, 0, len(memberURIs))
+	for _, uri := range memberURIs {
+		if c.skipChassis(resourceIDFromURI(uri)) {
+			continue
+		}
+		chassis, err := schemas.GetChassis(client.GetService().GetClient(), uri)
+		if err != nil {
+			logger.Error("error getting chassis", slog.String("chassis", uri), slog.Any("error", err))
+			continue
+		}
+		chassises = append(chassises, chassis)
+	}
+	return chassises, nil
+}
+
+// chassisCollectionURI returns the ChassisCollection URI advertised by the service root.
+//
+// gofish parses the same link but keeps it unexported, so it is re-read from the service
+// root here. Synthesising "/redfish/v1/Chassis" would work on every BMC we have captured,
+// but a wrong guess here silently collects nothing at all, which is not a failure mode worth
+// trading one request for.
+func (c *ChassisCollector) chassisCollectionURI(client *gofish.APIClient) (string, error) {
+	response, err := client.Get(c.redfishClient.Service.ODataID)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close() //nolint:errcheck
+
+	var root struct {
+		Chassis odataLink `json:"Chassis"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&root); err != nil {
+		return "", err
+	}
+	if root.Chassis.ODataID == "" {
+		return "", fmt.Errorf("service root advertises no Chassis collection")
+	}
+	return root.Chassis.ODataID, nil
+}
+
+// chassisThermal returns the deprecated Thermal resource, or (nil, nil) when the
+// subsystem is disabled by configuration or not implemented by the chassis.
+func (c *ChassisCollector) chassisThermal(chassis *schemas.Chassis) (*schemas.Thermal, error) {
+	if c.config.DisableThermal {
+		return nil, nil
+	}
+	return chassis.Thermal()
+}
+
+// chassisPower returns the deprecated Power resource, or (nil, nil) when the subsystem
+// is disabled by configuration or not implemented by the chassis.
+func (c *ChassisCollector) chassisPower(chassis *schemas.Chassis) (*schemas.Power, error) {
+	if c.config.DisablePower {
+		return nil, nil
+	}
+	return chassis.Power()
+}
+
+// chassisThermalSubsystem returns the ThermalSubsystem resource, or (nil, nil) when the
+// subsystem is disabled by configuration or not implemented by the chassis.
+func (c *ChassisCollector) chassisThermalSubsystem(chassis *schemas.Chassis) (*schemas.ThermalSubsystem, error) {
+	if c.config.DisableThermalSubsystem {
+		return nil, nil
+	}
+	return chassis.ThermalSubsystem()
+}
+
+// chassisNetworkAdapters returns the chassis network adapters, or (nil, nil) when the
+// subsystem is disabled by configuration or not implemented by the chassis.
+func (c *ChassisCollector) chassisNetworkAdapters(chassis *schemas.Chassis) ([]*schemas.NetworkAdapter, error) {
+	if c.config.DisableNetworkAdapters {
+		return nil, nil
+	}
+	return chassis.NetworkAdapters()
 }
 
 // sensorCollection is the shape of an expanded Sensors collection response. Members are

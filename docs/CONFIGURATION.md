@@ -115,7 +115,57 @@ request per chassis rather than one per sensor. A BMC that does not honour `$exp
 **not** fanned out to one request per sensor — that would multiply load against the BMCs
 least able to absorb it — so the bulk sensor telemetry is skipped with a warning instead.
 
-Exposes no user configuration.
+#### Configuration
+
+```yaml
+chassis_collector:
+  # Regular expressions matched against each chassis Id. Include is applied first.
+  [ chassis_include: <regexp> ]
+  [ chassis_exclude: <regexp> ]
+
+  # Regular expression matched against each Sensor Id. Matching sensors emit no metrics.
+  # Trims series count, not request count: the collection arrives in one request either
+  # way.
+  #
+  # Omitting the key and setting it to "" are different: omitted means the default below,
+  # empty means exclude nothing.
+  [ sensor_exclude: <regexp> | default = "_CoreUtil_[0-9]+$" ]
+
+  # Subsystem opt-outs. Every default is false, so an empty config collects everything.
+  [ disable_thermal: <bool> ]
+  [ disable_thermal_subsystem: <bool> ]   # also disables leak detection
+  [ disable_power: <bool> ]
+  [ disable_network_adapters: <bool> ]
+  [ disable_sensors: <bool> ]
+```
+
+`chassis_include` and `chassis_exclude` filter *before* each chassis body is fetched, by
+matching the trailing segment of the member link. Filtering after the fetch would pay the
+entire per-scrape cost anyway — forty-two chassis fetched to look at one — so a narrowly
+scoped module is the case this exists for. The trailing segment is a convention rather than
+a guarantee, so the fetched `Id` is still checked authoritatively afterwards.
+
+Setting `disable_thermal` and `disable_power` together also suppresses the `Sensors` pass:
+an operator who has opted out of bulk thermal and power data has not asked for it back under
+a different schema. On the platforms that implement neither legacy schema, `Sensors` would
+otherwise stand in for exactly what was just disabled.
+
+`sensor_exclude` defaults to `"_CoreUtil_[0-9]+$"`. A GB300 tray publishes 144 per-core CPU
+utilisation sensors, which is more series than the rest of the chassis collector produces
+for that tray combined, and the same data is available in-band from `node_exporter` at
+higher resolution. The telemetry collector already declines the identical sensors, so this
+keeps the two collectors from disagreeing about the same hardware; expressing it as a
+configuration default rather than as a rule in the collector keeps the judgement visible and
+overridable, and leaves the collector free of any inference from sensor names.
+
+The default applies wherever the key is absent — a hand-written `chassis_collector:` block,
+`chassis_collector: {}`, and the built-in modules all behave identically. To collect those
+sensors, set the pattern to the empty string:
+
+```yaml
+chassis_collector:
+  sensor_exclude: ""
+```
 
 ### `<gpu_collector>`
 [source](../collector/gpu_collector.go)
