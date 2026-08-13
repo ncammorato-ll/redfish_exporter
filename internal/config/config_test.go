@@ -299,9 +299,9 @@ func TestSensorExcludeDefaulting(t *testing.T) {
 		})
 	}
 
-	// The built-in module must resolve to the same pattern, so that switching between a
+	// The built-in modules must resolve to the same pattern, so that switching between a
 	// shipped module and a hand-written one does not silently change what is collected.
-	for _, name := range []string{"chassis_collector"} {
+	for _, name := range []string{"chassis_collector", "leak_detection"} {
 		assert.Equal(t, DefaultSensorExclude, DefaultModuleConfig[name].ChassisCollector.SensorExcludePattern())
 	}
 }
